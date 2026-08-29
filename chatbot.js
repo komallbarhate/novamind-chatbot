@@ -592,7 +592,7 @@ async function discoverModel() {
     let models = (data.models || [])
       .filter(m => m.supportedGenerationMethods?.includes("generateContent"))
       .map(m => m.name.replace("models/",""))
-      .filter(m => !BLOCKED_MODELS.includes(m))
+      .filter(m => !BLOCKED_MODELS.includes(m) && !m.startsWith("gemini-2.5"))
       .filter(m => !m.includes("tts") && !m.includes("embedding") && !m.includes("transcribe") && !m.includes("robotics") && !m.includes("veo") && !m.includes("aqa"));
 
     models.sort((a,b) => {

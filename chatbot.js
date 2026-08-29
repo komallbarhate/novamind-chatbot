@@ -8,9 +8,31 @@
 // ── Gemini Configuration ──────────────────────────────────────────────────────
 const BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 
+// Preferred model priority order
+const PREFERRED_MODELS = [
+  "gemini-3.6-flash",
+  "gemini-3.7-flash",
+  "gemini-flash-latest",
+  "gemini-3.5-flash",
+  "gemini-3.1-flash-lite",
+  "gemini-flash-lite-latest",
+  "gemini-pro-latest",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
+  "gemini-1.5-flash",
+  "gemini-1.5-pro"
+];
+
+// Block models that are known to be sunset / deprecated / restricted
+const BLOCKED_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-2.5-pro"
+];
+
 // GEMINI_API_KEY is loaded from config.js (gitignored — never pushed to GitHub)
-let GEMINI_MODEL    = null;
-let GEMINI_ENDPOINT = null;
+let GEMINI_MODEL       = "gemini-3.6-flash";
+let DISCOVERED_MODELS  = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-flash-latest"];
+let GEMINI_ENDPOINT    = null;
 
 function getActiveAPIKey() {
   if (typeof GEMINI_API_KEYS !== "undefined" && Array.isArray(GEMINI_API_KEYS) && GEMINI_API_KEYS.length > 0) {
@@ -567,20 +589,26 @@ async function discoverModel() {
       throw lastError || new Error("Failed to connect with any available API key.");
     }
 
-    const PREFER = ["flash","pro"];
-    const models = (data.models || [])
+    let models = (data.models || [])
       .filter(m => m.supportedGenerationMethods?.includes("generateContent"))
-      .map(m => m.name.replace("models/",""));
+      .map(m => m.name.replace("models/",""))
+      .filter(m => !BLOCKED_MODELS.includes(m))
+      .filter(m => !m.includes("tts") && !m.includes("embedding") && !m.includes("transcribe") && !m.includes("robotics") && !m.includes("veo") && !m.includes("aqa"));
 
     models.sort((a,b) => {
-      const ai = PREFER.findIndex(p => a.includes(p));
-      const bi = PREFER.findIndex(p => b.includes(p));
-      return (ai===-1?99:ai)-(bi===-1?99:bi);
+      const ai = PREFERRED_MODELS.indexOf(a);
+      const bi = PREFERRED_MODELS.indexOf(b);
+      const scoreA = ai === -1 ? 999 : ai;
+      const scoreB = bi === -1 ? 999 : bi;
+      return scoreA - scoreB;
     });
 
-    if (!models.length) throw new Error("No generateContent models found.");
-
-    GEMINI_MODEL    = models[0];
+    if (models.length > 0) {
+      DISCOVERED_MODELS = models;
+      GEMINI_MODEL = models[0];
+    } else {
+      GEMINI_MODEL = "gemini-3.6-flash";
+    }
 
     updateModelLabel();
     if (mlDot) { mlDot.className = ""; mlDot.classList.add("ml-dot","ml-dot--ready"); }
@@ -596,7 +624,7 @@ async function discoverModel() {
 
 // ── Gemini API ────────────────────────────────────────────────────────────────
 async function callGemini(text, imagePart = null) {
-  if (!GEMINI_MODEL) throw new Error("No model. Please refresh.");
+  if (!GEMINI_MODEL) GEMINI_MODEL = "gemini-3.6-flash";
 
   const parts = [];
   if (imagePart) parts.push(imagePart);
@@ -621,7 +649,7 @@ async function callGemini(text, imagePart = null) {
   };
 
   let attempts = 0;
-  const maxAttempts = Math.max(3, Math.min(6, getNumKeys() + 2));
+  const maxAttempts = Math.max(4, Math.min(8, getNumKeys() + 3));
   let lastError = null;
   const keysTried = new Set();
 
@@ -631,7 +659,8 @@ async function callGemini(text, imagePart = null) {
         || m.includes("access") || m.includes("429") || m.includes("403")
         || m.includes("overload") || m.includes("unavailable")
         || m.includes("high demand") || m.includes("try again")
-        || m.includes("503") || m.includes("resource_exhausted");
+        || m.includes("503") || m.includes("resource_exhausted")
+        || m.includes("no longer available") || m.includes("not found");
   };
 
   while (attempts < maxAttempts) {
@@ -665,11 +694,27 @@ async function callGemini(text, imagePart = null) {
         const err = await res.json().catch(()=>({}));
         const msg = err?.error?.message || `HTTP ${res.status}`;
         
+        // If the model itself is deprecated, unavailable, or 404, switch to next candidate model
+        if (msg.toLowerCase().includes("no longer available") || msg.toLowerCase().includes("not found") || res.status === 404) {
+          console.warn(`Model ${GEMINI_MODEL} is unavailable: ${msg}. Switching model...`);
+          const currIdx = DISCOVERED_MODELS.indexOf(GEMINI_MODEL);
+          if (currIdx !== -1 && currIdx + 1 < DISCOVERED_MODELS.length) {
+            GEMINI_MODEL = DISCOVERED_MODELS[currIdx + 1];
+          } else {
+            GEMINI_MODEL = "gemini-3.6-flash";
+          }
+          continue;
+        }
+
         if (attempts < maxAttempts && (res.status === 429 || res.status === 403 || res.status === 503 || isRetryableMsg(msg))) {
           console.warn(`API error (${res.status}: ${msg}). Retrying... (Attempt ${attempts}/${maxAttempts})`);
-          // Wait 1s before retrying on overload/503
+          // If high demand or 503, try switching model or backoff
           if (res.status === 503 || msg.toLowerCase().includes("high demand") || msg.toLowerCase().includes("overload")) {
-            await new Promise(r => setTimeout(r, 1000));
+            const currIdx = DISCOVERED_MODELS.indexOf(GEMINI_MODEL);
+            if (currIdx !== -1 && currIdx + 1 < DISCOVERED_MODELS.length) {
+              GEMINI_MODEL = DISCOVERED_MODELS[currIdx + 1];
+            }
+            await new Promise(r => setTimeout(r, 800));
           }
           continue;
         }
@@ -687,9 +732,9 @@ async function callGemini(text, imagePart = null) {
     } catch (err) {
       lastError = err;
       if (attempts < maxAttempts && isRetryableMsg(err.message)) {
-        console.warn(`Fetch error: ${err.message}. Retrying with another key...`);
+        console.warn(`Fetch error: ${err.message}. Retrying with another key / model...`);
         if (isRetryableMsg(err.message) && (err.message.includes("503") || err.message.toLowerCase().includes("demand"))) {
-          await new Promise(r => setTimeout(r, 1000));
+          await new Promise(r => setTimeout(r, 800));
         }
         continue;
       }
